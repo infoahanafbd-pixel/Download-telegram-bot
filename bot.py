@@ -3,6 +3,7 @@ import re
 import shutil
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import telebot
@@ -16,7 +17,7 @@ if not BOT_TOKEN:
 bot = telebot.TeleBot(BOT_TOKEN, threaded=True)
 URL_REGEX = re.compile(r"https?://\S+")
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
-YOUTUBE_CLIENTS = ["android_vr", "tv", "ios", "mweb"]
+YOUTUBE_CLIENTS = ["tv", "android_vr", "ios", "mweb"]
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -61,10 +62,10 @@ def download_video(url, tmp_dir):
             "outtmpl": os.path.join(out_dir, "video.%(ext)s"),
             "format": (
                 "best[ext=mp4][filesize<48M]/"
-                "best[ext=mp4][filesize_approx<48M]/"
-                "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/"
-                "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/"
-                "best[ext=mp4]/best"
+                "best[filesize<48M]/"
+                "bestvideo[height<=480]+bestaudio/"
+                "bestvideo[height<=360]+bestaudio/"
+                "bestvideo+bestaudio/best"
             ),
             "merge_output_format": "mp4",
             "noplaylist": True,
@@ -101,6 +102,7 @@ def download_video(url, tmp_dir):
 
             return file_path, title
         except Exception as e:
+            print(f"Client {client} failed: {e}", flush=True)
             last_error = e
             shutil.rmtree(out_dir, ignore_errors=True)
             continue
@@ -169,6 +171,7 @@ def handle_link(message):
 
 if __name__ == "__main__":
     threading.Thread(target=start_web_server, daemon=True).start()
+    time.sleep(5)
     bot.remove_webhook()
     bot.set_my_commands([BotCommand("start", "বট চালু করুন")])
     print("Bot is running...", flush=True)
