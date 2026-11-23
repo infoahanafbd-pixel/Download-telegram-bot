@@ -1,202 +1,128 @@
 import os
 import re
-import time
-import uuid
-import base64
-import asyncio
-import uvloop
+import shutil
+import tempfile
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-uvloop.install()
-loop = asyncio.new_event_loop()
-asyncio.set_event_loop(loop)
-
+import telebot
+from telebot.types import BotCommand
 import yt_dlp
-from aiohttp import web
-from pyrogram import Client, filters, idle
 
-# ===== Render Environment Variables থেকে ডাটা নেবে =====
-API_ID = int(os.environ["API_ID"])
-API_HASH = os.environ["API_HASH"]
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-PORT = int(os.environ.get("PORT", "8080"))
+BOT_TOKEN = os.environ.get("BOT_API") or os.environ.get("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_API environment variable is missing.")
 
-DOWNLOAD_DIR = "/tmp/downloads"
-COOKIES_PATH = "/tmp/cookies.txt"
-MAX_CONCURRENT_DOWNLOADS = 5  # একসাথে সর্বোচ্চ ৫টি বড় ভিডিও ডাউনলোড হবে
-
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
-# YouTube ক্লাউড আইপি ব্লক এড়াতে অপশনাল কুকিজ সাপোর্ট
-cookies_b64 = os.environ.get("COOKIES_B64", "").strip()
-if cookies_b64:
-    with open(COOKIES_PATH, "wb") as f:
-        f.write(base64.b64decode(cookies_b64))
-
-URL_PATTERN = re.compile(
-    r"(https?://(?:www\.|m\.|web\.|mobile\.)?(?:youtube\.com|youtu\.be|facebook\.com|fb\.watch|fb\.com)/\S+)",
-    re.IGNORECASE,
-)
-
-download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
-
-app = Client(
-    "render_fast_dl_bot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN,
-    workers=32,
-    max_concurrent_transmissions=10,  # একসাথে একাধিক ইউজারকে ফাস্ট আপলোড
-    in_memory=True,
-)
+bot = telebot.TeleBot(BOT_TOKEN, threaded=True)
+URL_REGEX = re.compile(r"https?://\S+")
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB (Telegram Bot API limit)
 
 
-def download_video_sync(url: str, uid: str) -> dict:
-    out_template = os.path.join(DOWNLOAD_DIR, f"{uid}.%(ext)s")
-    ydl_opts = {
-        "outtmpl": out_template,
-        # রি-এনকোডিং ছাড়া সরাসরি MP4 মার্জ (সুপারফাস্ট)
-        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "merge_output_format": "mp4",
-        "concurrent_fragment_downloads": 16,  # হাই-স্পিড মাল্টি-কানেকশন
-        "http_chunk_size": 10485760,  # 10 MB চাঙ্ক (YouTube স্পিড লিমিট বাইপাস)
-        "buffersize": 1024 * 1024,
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "retries": 5,
-        "fragment_retries": 5,
-        "max_filesize": 2000 * 1024 * 1024,  # ২ GB লিমিট
-    }
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running")
 
-    if os.path.exists(COOKIES_PATH):
-        ydl_opts["cookiefile"] = COOKIES_PATH
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        if "entries" in info and info["entries"]:
-            info = info["entries"][0]
-
-        file_path = ydl.prepare_filename(info)
-        base, _ = os.path.splitext(file_path)
-        mp4_path = base + ".mp4"
-
-        if os.path.exists(mp4_path):
-            file_path = mp4_path
-        elif not os.path.exists(file_path):
-            for fname in os.listdir(DOWNLOAD_DIR):
-                if fname.startswith(uid) and not fname.endswith(".part"):
-                    file_path = os.path.join(DOWNLOAD_DIR, fname)
-                    break
-
-        return {
-            "path": file_path,
-            "title": (info.get("title") or "Video")[:100],
-            "duration": int(info.get("duration") or 0),
-            "width": int(info.get("width") or 0),
-            "height": int(info.get("height") or 0),
-        }
+    def log_message(self, format, *args):
+        return
 
 
-def cleanup_files(uid: str):
-    for fname in os.listdir(DOWNLOAD_DIR):
-        if fname.startswith(uid):
-            try:
-                os.remove(os.path.join(DOWNLOAD_DIR, fname))
-            except OSError:
-                pass
+def start_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server.serve_forever()
 
 
-@app.on_message(filters.command("start") & filters.private)
-async def start_handler(client, message):
-    await message.reply_text(
-        "স্বাগতম! যেকোনো **Facebook** বা **YouTube** ভিডিওর লিংক পাঠাও—সুপারফাস্ট ডাউনলোড করে দিচ্ছি।"
+@bot.message_handler(commands=["start", "help"])
+def send_welcome(message):
+    bot.reply_to(
+        message,
+        "স্বাগতম! YouTube বা Facebook ভিডিওর লিংক পাঠান, আমি ডাউনলোড করে দিচ্ছি।",
     )
 
 
-@app.on_message(filters.text & ~filters.command(["start"]))
-async def link_handler(client, message):
-    match = URL_PATTERN.search(message.text or "")
+@bot.message_handler(func=lambda m: bool(m.text))
+def handle_link(message):
+    match = URL_REGEX.search(message.text)
     if not match:
-        await message.reply_text("সঠিক একটি **Facebook** অথবা **YouTube** ভিডিওর লিংক দাও।")
+        bot.reply_to(message, "একটি সঠিক ভিডিও লিংক পাঠান।")
         return
 
-    url = match.group(1)
-    uid = uuid.uuid4().hex[:10]
-    status_msg = await message.reply_text("লিংক পেয়েছি, প্রসেস হচ্ছে...")
+    url = match.group(0)
+    status_msg = bot.reply_to(message, "ভিডিও ডাউনলোড হচ্ছে, একটু অপেক্ষা করুন...")
+    tmp_dir = tempfile.mkdtemp(prefix="ytdl_")
 
     try:
-        if download_semaphore.locked():
-            await status_msg.edit_text("একসাথে অনেক রিকোয়েস্ট চলছে, তোমারটা কিউতে আছে...")
+        ydl_opts = {
+            "outtmpl": os.path.join(tmp_dir, "video.%(ext)s"),
+            "format": (
+                "best[ext=mp4][filesize<49M]/"
+                "best[ext=mp4][filesize_approx<49M]/"
+                "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/"
+                "best[ext=mp4]/best"
+            ),
+            "merge_output_format": "mp4",
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+        }
 
-        async with download_semaphore:
-            await status_msg.edit_text("সুপারফাস্ট মোডে ডাউনলোড হচ্ছে...")
-            result = await asyncio.to_thread(download_video_sync, url, uid)
-            file_path = result["path"]
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            title = info.get("title", "Video")
+            file_path = ydl.prepare_filename(info)
 
-            if not os.path.exists(file_path):
-                await status_msg.edit_text("ভিডিও ফাইলটি পাওয়া যায়নি।")
-                return
+        if not os.path.exists(file_path):
+            files = os.listdir(tmp_dir)
+            if not files:
+                raise FileNotFoundError("ডাউনলোড করা ফাইল পাওয়া যায়নি।")
+            file_path = os.path.join(tmp_dir, files[0])
 
-            file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-            if file_size_mb > 2000:
-                await status_msg.edit_text(
-                    f"সাইজ {file_size_mb:.1f} MB। টেলিগ্রাম সর্বোচ্চ ২ GB সাপোর্ট করে।"
-                )
-                return
-
-            await status_msg.edit_text(f"ডাউনলোড শেষ ({file_size_mb:.1f} MB)! আপলোড হচ্ছে...")
-
-            last_edit = [0.0]
-
-            async def upload_progress(current, total):
-                now = time.time()
-                if now - last_edit[0] >= 4:
-                    last_edit[0] = now
-                    percent = (current / total) * 100
-                    try:
-                        await status_msg.edit_text(
-                            f"আপলোড হচ্ছে: {percent:.1f}% ({current / (1024*1024):.1f} / {total / (1024*1024):.1f} MB)"
-                        )
-                    except Exception:
-                        pass
-
-            await message.reply_video(
-                video=file_path,
-                caption=f"**{result['title']}**",
-                duration=result["duration"],
-                width=result["width"],
-                height=result["height"],
-                supports_streaming=True,
-                progress=upload_progress,
+        file_size = os.path.getsize(file_path)
+        if file_size > MAX_FILE_SIZE:
+            size_mb = file_size / (1024 * 1024)
+            bot.edit_message_text(
+                f"ভিডিওটির সাইজ {size_mb:.1f} MB। শুধু Bot Token দিয়ে ৫০ MB-এর বড় ফাইল পাঠানো যায় না।",
+                message.chat.id,
+                status_msg.message_id,
             )
-            await status_msg.delete()
+            return
+
+        bot.edit_message_text(
+            "ডাউনলোড শেষ! টেলিগ্রামে আপলোড হচ্ছে...",
+            message.chat.id,
+            status_msg.message_id,
+        )
+
+        with open(file_path, "rb") as video_file:
+            bot.send_video(
+                message.chat.id,
+                video_file,
+                caption=title[:1000],
+                supports_streaming=True,
+                timeout=120,
+            )
+
+        bot.delete_message(message.chat.id, status_msg.message_id)
 
     except Exception as e:
-        await status_msg.edit_text(f"ডাউনলোড ব্যর্থ হয়েছে:\n`{str(e)[:300]}`")
+        bot.edit_message_text(
+            f"ডাউনলোড করা যায়নি: {str(e)[:200]}",
+            message.chat.id,
+            status_msg.message_id,
+        )
     finally:
-        cleanup_files(uid)
-
-
-async def health_check(request):
-    return web.Response(text="Bot is running fast!")
-
-
-async def main():
-    # Render Web Service ও Background Worker দুই জায়গাতেই চলার জন্য হেলথ সার্ভার
-    web_app = web.Application()
-    web_app.router.add_get("/", health_check)
-    runner = web.AppRunner(web_app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-
-    await app.start()
-    print("Render Superfast Bot চালু হয়েছে...")
-    await idle()
-
-    await app.stop()
-    await runner.cleanup()
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
-    loop.run_until_complete(main())
+    threading.Thread(target=start_web_server, daemon=True).start()
+    bot.remove_webhook()
+    bot.set_my_commands([BotCommand("start", "বট চালু করুন")])
+    print("Bot is running...", flush=True)
+    bot.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=30)
