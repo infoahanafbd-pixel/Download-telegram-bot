@@ -15,7 +15,8 @@ if not BOT_TOKEN:
 
 bot = telebot.TeleBot(BOT_TOKEN, threaded=True)
 URL_REGEX = re.compile(r"https?://\S+")
-MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB (Telegram Bot API limit)
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
+YOUTUBE_CLIENTS = ["android_vr", "tv", "ios", "mweb"]
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -38,6 +39,75 @@ def start_web_server():
     server.serve_forever()
 
 
+def get_cookie_file(tmp_dir):
+    cookies_text = os.environ.get("YT_COOKIES")
+    if not cookies_text:
+        return None
+    cookie_path = os.path.join(tmp_dir, "cookies.txt")
+    with open(cookie_path, "w", encoding="utf-8") as f:
+        f.write(cookies_text)
+    return cookie_path
+
+
+def download_video(url, tmp_dir):
+    is_youtube = "youtube.com" in url or "youtu.be" in url
+    cookie_file = get_cookie_file(tmp_dir)
+    clients_to_try = YOUTUBE_CLIENTS if is_youtube else [None]
+    last_error = None
+
+    for client in clients_to_try:
+        out_dir = tempfile.mkdtemp(dir=tmp_dir)
+        ydl_opts = {
+            "outtmpl": os.path.join(out_dir, "video.%(ext)s"),
+            "format": (
+                "best[ext=mp4][filesize<48M]/"
+                "best[ext=mp4][filesize_approx<48M]/"
+                "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/"
+                "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/"
+                "best[ext=mp4]/best"
+            ),
+            "merge_output_format": "mp4",
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "geo_bypass": True,
+        }
+
+        if cookie_file:
+            ydl_opts["cookiefile"] = cookie_file
+
+        if client:
+            ydl_opts["extractor_args"] = {
+                "youtube": {
+                    "player_client": [client],
+                }
+            }
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                title = info.get("title", "Video")
+                file_path = ydl.prepare_filename(info)
+
+            if not os.path.exists(file_path):
+                files = [
+                    os.path.join(out_dir, f)
+                    for f in os.listdir(out_dir)
+                    if not f.endswith(".part")
+                ]
+                if not files:
+                    raise FileNotFoundError("ডাউনলোড করা ফাইল পাওয়া যায়নি।")
+                file_path = max(files, key=os.path.getsize)
+
+            return file_path, title
+        except Exception as e:
+            last_error = e
+            shutil.rmtree(out_dir, ignore_errors=True)
+            continue
+
+    raise last_error or RuntimeError("ভিডিও ডাউনলোড ব্যর্থ হয়েছে।")
+
+
 @bot.message_handler(commands=["start", "help"])
 def send_welcome(message):
     bot.reply_to(
@@ -58,30 +128,7 @@ def handle_link(message):
     tmp_dir = tempfile.mkdtemp(prefix="ytdl_")
 
     try:
-        ydl_opts = {
-            "outtmpl": os.path.join(tmp_dir, "video.%(ext)s"),
-            "format": (
-                "best[ext=mp4][filesize<49M]/"
-                "best[ext=mp4][filesize_approx<49M]/"
-                "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/"
-                "best[ext=mp4]/best"
-            ),
-            "merge_output_format": "mp4",
-            "noplaylist": True,
-            "quiet": True,
-            "no_warnings": True,
-        }
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            title = info.get("title", "Video")
-            file_path = ydl.prepare_filename(info)
-
-        if not os.path.exists(file_path):
-            files = os.listdir(tmp_dir)
-            if not files:
-                raise FileNotFoundError("ডাউনলোড করা ফাইল পাওয়া যায়নি।")
-            file_path = os.path.join(tmp_dir, files[0])
+        file_path, title = download_video(url, tmp_dir)
 
         file_size = os.path.getsize(file_path)
         if file_size > MAX_FILE_SIZE:
