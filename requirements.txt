@@ -1,5 +1,2 @@
-pyrofork
-tgcrypto
+pyTelegramBotAPI
 yt-dlp
-uvloop
-aiohttp
